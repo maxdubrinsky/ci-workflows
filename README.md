@@ -6,8 +6,8 @@ needs only ~15 lines of caller YAML instead of the ~230-line monolith.
 
 ## Layout
 
-```
-.github/workflows/triage-testflight.yml   reusable workflow (workflow_call)
+```text
+.github/workflows/triage-testflight.yml    reusable workflow (workflow_call)
 prompts/triage.md                          templated triage prompt
 bootstrap/bootstrap-feedback.sh            per-app wiring CLI
 bootstrap/caller-workflow.template.yml     caller workflow template
@@ -18,7 +18,7 @@ bootstrap/caller-workflow.template.yml     caller workflow template
 1. Hourly cron pulls TestFlight feedback + crashes from App Store Connect.
 2. Creates a Linear issue per item (idempotent via `attachmentsForURL`).
 3. Finds untriaged TF tickets (state=Triage, priority=None,
-   title prefix `[TestFlight `).
+   title prefix `[TestFlight`).
 4. Hands them to `anthropics/claude-code-action@v1` which runs the prompt
    in `prompts/triage.md` against the Linear MCP server. The action
    authenticates via `CLAUDE_CODE_OAUTH_TOKEN` so usage bills against the
@@ -38,12 +38,13 @@ cd /path/to/new-ios-app
 ```
 
 The script:
+
 - Sources shared secrets from `~/.config/feedback-pipeline.env` if it
   exists; otherwise prompts.
 - Verifies the Linear project exists.
 - Pushes all required GitHub secrets via `gh secret set`.
 - Writes `.github/workflows/triage-testflight.yml` in the current repo
-  (the caller — uses `msdubrin/ci-workflows/.github/workflows/triage-testflight.yml@main`).
+  (the caller — uses `maxdubrinsky/ci-workflows/.github/workflows/triage-testflight.yml@main`).
 
 Commit and push the new workflow file, then optionally trigger a dry run:
 

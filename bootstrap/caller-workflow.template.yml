@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   triage:
-    uses: msdubrin/ci-workflows/.github/workflows/triage-testflight.yml@main
+    uses: maxdubrinsky/ci-workflows/.github/workflows/triage-testflight.yml@main
     with:
       app_name: "__APP_NAME__"
       linear_project: "__LINEAR_PROJECT__"

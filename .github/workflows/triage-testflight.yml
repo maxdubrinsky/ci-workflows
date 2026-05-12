@@ -79,7 +79,7 @@ jobs:
       - name: Checkout ci-workflows (for prompt template)
         uses: actions/checkout@v4
         with:
-          repository: msdubrin/ci-workflows
+          repository: maxdubrinsky/ci-workflows
           ref: ${{ inputs.ci_workflows_ref }}
           path: .ci-workflows
 
