@@ -1,0 +1,275 @@
+name: Triage TestFlight Feedback
+
+# Reusable workflow. Call it from per-app repos with `uses:` + `workflow_call`.
+# See bootstrap/caller-workflow.template.yml for the caller shape.
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "Human-readable app name (used in logs + Linear titles)"
+        required: true
+        type: string
+      linear_project:
+        description: "Linear project name, e.g. 'Local Tasks'"
+        required: true
+        type: string
+      ticket_prefix:
+        description: "Linear team key, e.g. 'MSD' or 'MTM'"
+        required: true
+        type: string
+      app_module:
+        description: "Swift module name for crash-frame heuristic, e.g. 'LocalTasks'"
+        required: true
+        type: string
+      window_hours:
+        description: "Look-back window for TestFlight feedback (hours)"
+        required: false
+        type: string
+        default: "2"
+      dry_run:
+        description: "Log what would be created without posting to Linear"
+        required: false
+        type: boolean
+        default: false
+      ci_workflows_ref:
+        description: "Git ref of ci-workflows to check out for prompt template"
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      TESTFLIGHT_KEY_ID:
+        required: true
+      TESTFLIGHT_ISSUER_ID:
+        required: true
+      TESTFLIGHT_PRIVATE_KEY_B64:
+        required: true
+      TESTFLIGHT_BUNDLE_ID:
+        required: true
+      LINEAR_API_TOKEN:
+        required: true
+      LINEAR_TEAM_ID:
+        required: true
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: triage-testflight-${{ inputs.app_name }}
+  cancel-in-progress: false
+
+jobs:
+  sync-and-triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ASC_KEY_ID: ${{ secrets.TESTFLIGHT_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.TESTFLIGHT_ISSUER_ID }}
+      ASC_PRIVATE_KEY_B64: ${{ secrets.TESTFLIGHT_PRIVATE_KEY_B64 }}
+      ASC_BYPASS_KEYCHAIN: "true"
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_TOKEN }}
+      TEAM_ID: ${{ secrets.LINEAR_TEAM_ID }}
+      LINEAR_PROJECT: ${{ inputs.linear_project }}
+      BUNDLE_ID: ${{ secrets.TESTFLIGHT_BUNDLE_ID }}
+      WINDOW_HOURS: ${{ inputs.window_hours }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Checkout ci-workflows (for prompt template)
+        uses: actions/checkout@v4
+        with:
+          repository: msdubrin/ci-workflows
+          ref: ${{ inputs.ci_workflows_ref }}
+          path: .ci-workflows
+
+      - name: Install asc + go-linear
+        run: |
+          set -euo pipefail
+          ASC_VER=1.2.6
+          GL_VER=v2.2.1
+          ASC_SHA=2cf40af473942a75a0fba705a5587adde8b639648bcbdca59a0eb5972073da59
+          GL_SHA=67ddf00743d291ca9f56316ba362079482551a11ed4f574baa03f922bc1da4e8
+
+          curl -fsSL "https://github.com/rorkai/App-Store-Connect-CLI/releases/download/${ASC_VER}/asc_${ASC_VER}_linux_amd64" -o /usr/local/bin/asc
+          echo "${ASC_SHA}  /usr/local/bin/asc" | sha256sum -c -
+          chmod +x /usr/local/bin/asc
+
+          curl -fsSL "https://github.com/chainguard-sandbox/go-linear/releases/download/${GL_VER}/go-linear-${GL_VER}-linux-amd64" -o /usr/local/bin/go-linear
+          echo "${GL_SHA}  /usr/local/bin/go-linear" | sha256sum -c -
+          chmod +x /usr/local/bin/go-linear
+
+          asc version
+          go-linear --version
+
+      - name: Sync TestFlight feedback to Linear
+        id: sync
+        run: |
+          set -euo pipefail
+
+          APP_ID=$(asc apps list --bundle-id "$BUNDLE_ID" --output json | jq -r '.data[0].id // empty')
+          [[ -n "$APP_ID" ]] || { echo "::error::No app for bundleId=$BUNDLE_ID"; exit 1; }
+          since_epoch=$(date -u -d "${WINDOW_HOURS} hours ago" +%s)
+          echo "Resolved app_id=$APP_ID window=${WINDOW_HOURS}h since=$(date -u -d "@$since_epoch" -Iseconds) dry_run=${DRY_RUN}"
+
+          attachments_for_url() {
+            curl -fsS -X POST https://api.linear.app/graphql \
+              -H "Authorization: $LINEAR_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg u "$1" '{query:"query($u:String!){attachmentsForURL(url:$u,first:1){nodes{id}}}",variables:{u:$u}}')" \
+              | jq -r '.data.attachmentsForURL.nodes | length'
+          }
+
+          created=0; skipped=0; failed=0
+
+          process_kind() {
+            local kind="$1"
+            local ndjson="/tmp/${kind}.ndjson"
+
+            asc testflight "$kind" list --app "$APP_ID" --paginate --sort -createdDate --output json \
+              | jq -c --argjson since "$since_epoch" --arg kind "$kind" '
+                  .data[]
+                  | (.attributes.createdDate | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $ts
+                  | select($ts >= $since)
+                  | {id, kind: $kind, url: .links.self, attrs: .attributes}
+                ' > "$ndjson"
+
+            local count
+            count=$(wc -l < "$ndjson" | tr -d ' ')
+            echo "  ${kind}: ${count} within window"
+
+            local item id url comment first title meta description issue_id log
+            while IFS= read -r item; do
+              id=$(jq -r '.id' <<<"$item")
+              url=$(jq -r '.url' <<<"$item")
+
+              if [[ "$(attachments_for_url "$url")" != "0" ]]; then
+                echo "    $id: already linked, skip"
+                skipped=$((skipped + 1))
+                continue
+              fi
+
+              comment=$(jq -r '.attrs.comment // ""' <<<"$item")
+              first=$(printf '%s' "$comment" | head -n1 | cut -c1-80)
+              title="[TestFlight ${kind}] ${first:-${kind} feedback} (${id: -12})"
+
+              meta=$(jq -r '
+                .attrs | to_entries
+                | map(select(.key | test("^(createdDate|email|deviceModel|osVersion|connectionType|batteryPercentage|architecture|appUptimeInMilliseconds|diskBytesAvailable|diskBytesTotal)$")))
+                | map("- **\(.key):** \(.value)") | join("\n")
+              ' <<<"$item")
+
+              description="**Kind:** ${kind}"$'\n\n'
+              [[ -n "$comment" ]] && description+="### Comment"$'\n'"${comment}"$'\n\n'
+              [[ -n "$meta" ]]    && description+="### Metadata"$'\n'"${meta}"$'\n\n'
+
+              if [[ "$kind" == "crashes" ]]; then
+                log=$(asc testflight crashes log --submission-id "$id" --output json | jq -r '.data.attributes.logText // ""')
+                if [[ -n "$log" ]]; then
+                  description+="### Crash log"$'\n''```'$'\n'"$(printf '%s' "$log" | head -c 50000)"$'\n''```'$'\n'
+                fi
+              fi
+
+              if [[ "$DRY_RUN" == "true" ]]; then
+                echo "    $id: [dry-run] would create — $title"
+                created=$((created + 1))
+                continue
+              fi
+
+              issue_json=$(go-linear issue create \
+                --team "$TEAM_ID" \
+                --project "$LINEAR_PROJECT" \
+                --state "Triage" \
+                --title "$title" \
+                --description "$description" 2>&1) || {
+                  echo "::error::issue create failed for $id: $issue_json"
+                  failed=$((failed + 1)); continue
+                }
+              issue_id=$(jq -r '.identifier // .id // empty' <<<"$issue_json" 2>/dev/null || true)
+              if [[ -z "$issue_id" ]]; then
+                echo "::error::could not parse issue id from create output for $id: $issue_json"
+                failed=$((failed + 1)); continue
+              fi
+
+              if ! go-linear attachment link-url \
+                --issue "$issue_id" \
+                --url "$url" \
+                --title "App Store Connect: ${kind} ${id}" >/dev/null 2>&1; then
+                echo "::warning::issue $issue_id created but attachment link-url failed for $id"
+                failed=$((failed + 1)); continue
+              fi
+
+              echo "    $id: created $issue_id"
+              created=$((created + 1))
+            done < "$ndjson"
+          }
+
+          process_kind feedback
+          process_kind crashes
+
+          echo "::notice::Sync done. created=$created skipped=$skipped failed=$failed"
+          [[ "$failed" -eq 0 ]] || exit 1
+
+      - name: Find untriaged tickets
+        id: untriaged
+        if: always()
+        run: |
+          set -euo pipefail
+
+          # Sentinel: state=Triage AND priority=0 (None) AND title starts with [TestFlight .
+          # The triage step sets a non-zero priority on success, giving idempotent retries.
+          ids=$(curl -fsS -X POST https://api.linear.app/graphql \
+            -H "Authorization: $LINEAR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg p "$LINEAR_PROJECT" '{query:"query($p:String!){issues(filter:{project:{name:{eq:$p}},state:{name:{eq:\"Triage\"}},priority:{eq:0},title:{startsWith:\"[TestFlight \"}},first:50){nodes{identifier}}}",variables:{p:$p}}')" \
+            | jq -r '.data.issues.nodes[].identifier' | tr '\n' ' ' | sed 's/ $//')
+
+          count=$(printf '%s' "$ids" | tr ' ' '\n' | grep -c . || true)
+          echo "Found ${count} ticket(s) needing triage: ${ids:-(none)}"
+          {
+            echo "ids=${ids}"
+            echo "count=${count}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Render triage prompt
+        id: render
+        if: steps.untriaged.outputs.count != '0'
+        run: |
+          set -euo pipefail
+
+          # Substitute placeholders in the shared prompt template.
+          rendered=$(sed \
+            -e "s|{{ticket_prefix}}|${{ inputs.ticket_prefix }}|g" \
+            -e "s|{{linear_project}}|${{ inputs.linear_project }}|g" \
+            -e "s|{{linear_team_id}}|${TEAM_ID}|g" \
+            -e "s|{{app_module}}|${{ inputs.app_module }}|g" \
+            -e "s|{{app_name}}|${{ inputs.app_name }}|g" \
+            .ci-workflows/prompts/triage.md)
+
+          # Wrap with the per-run header carrying the ticket IDs.
+          {
+            echo 'prompt<<TRIAGE_PROMPT_EOF'
+            printf 'Triage the following Linear ticket(s) for %s: %s\n\n' \
+              "${{ inputs.app_name }}" "${{ steps.untriaged.outputs.ids }}"
+            printf '%s\n' "$rendered"
+            echo 'TRIAGE_PROMPT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Triage with Claude Code
+        if: steps.untriaged.outputs.count != '0'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.render.outputs.prompt }}
+          # The action installs Linear MCP via its standard mcp_config plumbing.
+          # If your fork of the action exposes a different MCP setup, swap here.
+          mcp_config: |
+            {
+              "mcpServers": {
+                "linear": {
+                  "command": "npx",
+                  "args": ["-y", "linear-mcp-server"],
+                  "env": { "LINEAR_API_KEY": "${{ secrets.LINEAR_API_TOKEN }}" }
+                }
+              }
+            }
