@@ -133,7 +133,8 @@ jobs:
 
             asc testflight "$kind" list --app "$APP_ID" --paginate --sort -createdDate --output json \
               | jq -c --argjson since "$since_epoch" --arg kind "$kind" '
-                  .data[]
+                  (.data // [])[]
+                  | select(.attributes.createdDate != null)
                   | (.attributes.createdDate | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $ts
                   | select($ts >= $since)
                   | {id, kind: $kind, url: .links.self, attrs: .attributes}
@@ -147,12 +148,6 @@ jobs:
             while IFS= read -r item; do
               id=$(jq -r '.id' <<<"$item")
               url=$(jq -r '.url' <<<"$item")
-
-              # TEMP diagnostic (dry-run only, keys/types only — no PII): learn
-              # the real asc feedback payload shape so we extract content correctly.
-              if [[ "$DRY_RUN" == "true" ]]; then
-                echo "    [diag] $id itemKeys=$(jq -cr 'keys' <<<"$item") urlType=$(jq -r '.url|type' <<<"$item") attrsType=$(jq -r '.attrs|type' <<<"$item") attrsKeys=$(jq -cr 'if (.attrs|type)=="object" then (.attrs|keys) else .attrs end' <<<"$item")"
-              fi
 
               if [[ "$(attachments_for_url "$url")" != "0" ]]; then
                 echo "    $id: already linked, skip"
