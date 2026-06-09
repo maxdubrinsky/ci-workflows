@@ -268,16 +268,25 @@ jobs:
       - name: Triage with Claude Code
         if: steps.untriaged.outputs.count != '0'
         uses: anthropics/claude-code-action@v1
+        env:
+          # Bound the stdio MCP `initialize` handshake. Claude Code otherwise
+          # waits on it forever (anthropics/claude-code#35287) — a stalled
+          # linear-mcp-server is what burned the whole 15-min job timeout.
+          MCP_TIMEOUT: "60000"
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: ${{ steps.render.outputs.prompt }}
           track_progress: false # headless prompt run — no PR/issue progress UI
+          show_full_output: true # TEMP(diag): unredact SDK/MCP output
           # claude-code-action@v1 dropped the `mcp_config` input; MCP servers
-          # are registered through `claude_args` via `--mcp-config`. Use INLINE
-          # JSON — a file path is silently dropped (anthropics/claude-code-action#1004).
-          # `--allowedTools` is required for the Linear MCP tools to be callable
-          # in a non-interactive (prompt-driven) run.
+          # are registered through `claude_args` via `--mcp-config` (INLINE JSON —
+          # a file path is silently dropped, anthropics/claude-code-action#1004).
+          # Headless mode needs `--permission-mode acceptEdits` so tool calls
+          # don't block on an approval prompt; `--allowedTools` makes the Linear
+          # MCP tools callable. `--debug` is TEMP(diag).
           claude_args: >-
-            --mcp-config '{"mcpServers":{"linear":{"command":"npx","args":["-y","linear-mcp-server"],"env":{"LINEAR_API_KEY":"${{ secrets.LINEAR_API_TOKEN }}"}}}}'
+            --permission-mode acceptEdits
             --allowedTools "mcp__linear__*"
+            --debug
+            --mcp-config '{"mcpServers":{"linear":{"command":"npx","args":["-y","linear-mcp-server"],"env":{"LINEAR_API_KEY":"${{ secrets.LINEAR_API_TOKEN }}"}}}}'
