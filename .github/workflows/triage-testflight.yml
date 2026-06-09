@@ -226,67 +226,164 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Sentinel: state=Triage AND priority=0 (None) AND title starts with [TestFlight .
-          # The triage step sets a non-zero priority on success, giving idempotent retries.
-          ids=$(curl -fsS -X POST https://api.linear.app/graphql \
+          # Sentinel: state=Triage AND priority=0 (None) AND title starts with
+          # "[TestFlight ". The apply step below sets a non-zero priority as its
+          # LAST mutation, so a half-applied ticket (still priority 0) is retried.
+          curl -fsS -X POST https://api.linear.app/graphql \
             -H "Authorization: $LINEAR_API_KEY" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg p "$LINEAR_PROJECT" '{query:"query($p:String!){issues(filter:{project:{name:{eq:$p}},state:{name:{eq:\"Triage\"}},priority:{eq:0},title:{startsWith:\"[TestFlight \"}},first:50){nodes{identifier}}}",variables:{p:$p}}')" \
-            | jq -r '.data.issues.nodes[].identifier' | tr '\n' ' ' | sed 's/ $//')
+            -d "$(jq -n --arg p "$LINEAR_PROJECT" '{query:"query($p:String!){issues(filter:{project:{name:{eq:$p}},state:{name:{eq:\"Triage\"}},priority:{eq:0},title:{startsWith:\"[TestFlight \"}},first:50){nodes{id identifier title description createdAt}}}",variables:{p:$p}}')" \
+            | jq '.data.issues.nodes' > "$RUNNER_TEMP/targets.json"
 
-          count=$(printf '%s' "$ids" | tr ' ' '\n' | grep -c . || true)
+          count=$(jq 'length' "$RUNNER_TEMP/targets.json")
+          ids=$(jq -r '.[].identifier' "$RUNNER_TEMP/targets.json" | tr '\n' ' ' | sed 's/ $//')
           echo "Found ${count} ticket(s) needing triage: ${ids:-(none)}"
-          {
-            echo "ids=${ids}"
-            echo "count=${count}"
-          } >> "$GITHUB_OUTPUT"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
 
-      - name: Render triage prompt
-        id: render
+      # Triage WITHOUT an MCP server: Claude reasons over context we fetch and
+      # returns a strict JSON decision array; this step then applies each
+      # decision to Linear via GraphQL (the same REST/GraphQL seam the sync step
+      # uses). No stdio MCP = nothing to hang on. Auth for Claude is the Max-plan
+      # OAuth token via the headless `claude` CLI.
+      - name: Triage tickets and apply to Linear
         if: steps.untriaged.outputs.count != '0'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          APP_NAME: ${{ inputs.app_name }}
+          APP_MODULE: ${{ inputs.app_module }}
+          TICKET_PREFIX: ${{ inputs.ticket_prefix }}
         run: |
           set -euo pipefail
 
-          # Substitute placeholders in the shared prompt template.
+          gql() { # $1=query  $2=variables(JSON) ; prints .data, fails on errors
+            local resp
+            resp=$(curl -fsS -X POST https://api.linear.app/graphql \
+              -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json" \
+              -d "$(jq -n --arg q "$1" --argjson v "$2" '{query:$q,variables:$v}')")
+            if [[ "$(jq 'has("errors")' <<<"$resp")" == "true" ]]; then
+              echo "::error::GraphQL error: $(jq -c '.errors' <<<"$resp")" >&2
+              return 1
+            fi
+            jq '.data' <<<"$resp"
+          }
+
+          # ---- dupe context: open + recently-completed (<=21d), minus targets ----
+          since=$(date -u -d '21 days ago' +%Y-%m-%dT%H:%M:%S.000Z)
+          targets_ids=$(jq '[.[].identifier]' "$RUNNER_TEMP/targets.json")
+          allnodes=$(gql 'query($p:String!){issues(filter:{project:{name:{eq:$p}}},first:250){nodes{id identifier title state{name type} completedAt}}}' \
+            "$(jq -n --arg p "$LINEAR_PROJECT" '{p:$p}')" | jq '.issues.nodes')
+          jq -n --argjson a "$allnodes" --arg since "$since" --argjson t "$targets_ids" '
+            $a
+            | map(select(.identifier as $id | ($t | index($id)) | not))
+            | map(select(
+                (.state.type as $ty | (["triage","backlog","unstarted","started"] | index($ty)))
+                or (.state.type=="completed" and .completedAt!=null and .completedAt>=$since)))
+            | map({id:.identifier, title, state:.state.name, completedAt:.completedAt})
+          ' > "$RUNNER_TEMP/context.json"
+          echo "dupe-context: $(jq length "$RUNNER_TEMP/context.json") candidate(s)"
+
+          # identifier -> UUID map (targets + all candidates) for the apply step.
+          jq -n --argjson a "$allnodes" --argjson t "$(cat "$RUNNER_TEMP/targets.json")" \
+            '($a + $t) | map({(.identifier): .id}) | add // {}' > "$RUNNER_TEMP/uuidmap.json"
+
+          # ---- assemble the prompt (rules + data) ----
           rendered=$(sed \
-            -e "s|{{ticket_prefix}}|${{ inputs.ticket_prefix }}|g" \
-            -e "s|{{linear_project}}|${{ inputs.linear_project }}|g" \
+            -e "s|{{ticket_prefix}}|${TICKET_PREFIX}|g" \
+            -e "s|{{linear_project}}|${LINEAR_PROJECT}|g" \
             -e "s|{{linear_team_id}}|${TEAM_ID}|g" \
-            -e "s|{{app_module}}|${{ inputs.app_module }}|g" \
-            -e "s|{{app_name}}|${{ inputs.app_name }}|g" \
+            -e "s|{{app_module}}|${APP_MODULE}|g" \
+            -e "s|{{app_name}}|${APP_NAME}|g" \
             .ci-workflows/prompts/triage.md)
-
-          # Wrap with the per-run header carrying the ticket IDs.
           {
-            echo 'prompt<<TRIAGE_PROMPT_EOF'
-            printf 'Triage the following Linear ticket(s) for %s: %s\n\n' \
-              "${{ inputs.app_name }}" "${{ steps.untriaged.outputs.ids }}"
-            printf '%s\n' "$rendered"
-            echo 'TRIAGE_PROMPT_EOF'
-          } >> "$GITHUB_OUTPUT"
+            printf 'Triage the following %s ticket(s) and return the JSON array.\n\n' "$APP_NAME"
+            printf '%s\n\n## TICKETS\n\n```json\n' "$rendered"
+            jq '[.[] | {ticket_id: .identifier, title, description}]' "$RUNNER_TEMP/targets.json"
+            printf '\n```\n\n## DUPE_CONTEXT\n\n```json\n'
+            cat "$RUNNER_TEMP/context.json"
+            printf '\n```\n'
+          } > "$RUNNER_TEMP/prompt.txt"
 
-      - name: Triage with Claude Code
-        if: steps.untriaged.outputs.count != '0'
-        uses: anthropics/claude-code-action@v1
-        env:
-          # Bound the stdio MCP `initialize` handshake. Claude Code otherwise
-          # waits on it forever (anthropics/claude-code#35287) — a stalled
-          # linear-mcp-server is what burned the whole 15-min job timeout.
-          MCP_TIMEOUT: "60000"
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          prompt: ${{ steps.render.outputs.prompt }}
-          track_progress: false # headless prompt run — no PR/issue progress UI
-          show_full_output: true # TEMP(diag): unredact SDK/MCP output
-          # claude-code-action@v1 dropped the `mcp_config` input; MCP servers
-          # are registered through `claude_args` via `--mcp-config` (INLINE JSON —
-          # a file path is silently dropped, anthropics/claude-code-action#1004).
-          # Headless mode needs `--permission-mode acceptEdits` so tool calls
-          # don't block on an approval prompt; `--allowedTools` makes the Linear
-          # MCP tools callable. `--debug` is TEMP(diag).
-          claude_args: >-
-            --permission-mode acceptEdits
-            --allowedTools "mcp__linear__*"
-            --debug
-            --mcp-config '{"mcpServers":{"linear":{"command":"npx","args":["-y","linear-mcp-server"],"env":{"LINEAR_API_KEY":"${{ secrets.LINEAR_API_TOKEN }}"}}}}'
+          # ---- run Claude headless (no tools, no MCP — pure reasoning) ----
+          npm install -g @anthropic-ai/claude-code >/dev/null 2>&1
+          claude --version
+          raw=$(cd "$RUNNER_TEMP" && timeout 360 claude -p --output-format json --max-turns 1 < "$RUNNER_TEMP/prompt.txt") || {
+            echo "::error::claude run failed or timed out"; exit 1; }
+          if [[ "$(jq -r '.is_error // false' <<<"$raw")" == "true" ]]; then
+            echo "::error::claude returned an error: $(jq -r '.result // .error // ""' <<<"$raw")"; exit 1
+          fi
+          # Strip optional ```json fences, then require a JSON array.
+          jq -r '.result // ""' <<<"$raw" \
+            | sed -e 's/^[[:space:]]*```[a-zA-Z]*[[:space:]]*//' -e 's/[[:space:]]*```[[:space:]]*$//' \
+            > "$RUNNER_TEMP/decisions.json"
+          if ! jq -e 'type=="array"' "$RUNNER_TEMP/decisions.json" >/dev/null 2>&1; then
+            echo "::error::model did not return a JSON array:"; cat "$RUNNER_TEMP/decisions.json"; exit 1
+          fi
+          echo "parsed $(jq length "$RUNNER_TEMP/decisions.json") decision(s)"
+
+          # ---- resolve team label + state name->id maps ----
+          maps=$(gql 'query($t:String!){team(id:$t){labels(first:250){nodes{id name}} states(first:50){nodes{id name}}}}' \
+            "$(jq -n --arg t "$TEAM_ID" '{t:$t}')")
+          label_id() { jq -r --arg n "$1" '.team.labels.nodes[]|select(.name==$n)|.id' <<<"$maps" | head -n1; }
+          state_id() { jq -r --arg n "$1" '.team.states.nodes[]|select(.name==$n)|.id' <<<"$maps" | head -n1; }
+          declare -A PRI=( [Urgent]=1 [High]=2 [Medium]=3 [Low]=4 )
+
+          # ---- apply each decision ----
+          applied=0; failed=0
+          n=$(jq 'length' "$RUNNER_TEMP/decisions.json")
+          for ((k=0; k<n; k++)); do
+            d=$(jq ".[$k]" "$RUNNER_TEMP/decisions.json")
+            tid=$(jq -r '.ticket_id' <<<"$d")
+            cat=$(jq -r '.category' <<<"$d")
+            pri=$(jq -r '.priority' <<<"$d")
+            tstate=$(jq -r '.target_state' <<<"$d")
+            dup=$(jq -r '.duplicate_of // empty' <<<"$d")
+            summary=$(jq -r '.summary' <<<"$d")
+            rationale=$(jq -r '.rationale' <<<"$d")
+
+            uuid=$(jq -r --arg i "$tid" '.[]|select(.identifier==$i)|.id' "$RUNNER_TEMP/targets.json")
+            lid=$(label_id "$cat"); sid=$(state_id "$tstate"); pnum=${PRI[$pri]:-3}
+            if [[ -z "$uuid" || -z "$lid" || -z "$sid" ]]; then
+              echo "::error::$tid: unresolved uuid/label/state (uuid='$uuid' $cat->'$lid' $tstate->'$sid')"; failed=$((failed+1)); continue
+            fi
+
+            dupline=""; [[ -n "$dup" && "$tstate" == "Duplicate" ]] && dupline=" · **Duplicate of:** $dup"
+            body=$(printf '**Auto-triage**\n\n**Summary:** %s\n\n**Category:** %s · **Priority:** %s · **State:** %s%s\n\n**Rationale:** %s' \
+              "$summary" "$cat" "$pri" "$tstate" "$dupline" "$rationale")
+
+            if [[ "${DRY_RUN}" == "true" ]]; then
+              echo "  [dry-run] $tid -> $cat / $pri / $tstate${dup:+ (dup of $dup)}"
+              applied=$((applied+1)); continue
+            fi
+
+            # 1) state + category label
+            gql 'mutation($id:String!,$s:String!,$l:[String!]){issueUpdate(id:$id,input:{stateId:$s,labelIds:$l}){success}}' \
+              "$(jq -n --arg id "$uuid" --arg s "$sid" --arg l "$lid" '{id:$id,s:$s,l:[$l]}')" >/dev/null \
+              || { echo "::error::$tid: state/label update failed"; failed=$((failed+1)); continue; }
+
+            # 2) duplicate relation (best effort)
+            if [[ "$tstate" == "Duplicate" && -n "$dup" ]]; then
+              dupuuid=$(jq -r --arg i "$dup" '.[$i] // empty' "$RUNNER_TEMP/uuidmap.json")
+              if [[ -n "$dupuuid" ]]; then
+                gql 'mutation($i:String!,$r:String!,$t:IssueRelationType!){issueRelationCreate(input:{issueId:$i,relatedIssueId:$r,type:$t}){success}}' \
+                  "$(jq -n --arg i "$uuid" --arg r "$dupuuid" '{i:$i,r:$r,t:"duplicate"}')" >/dev/null \
+                  || echo "::warning::$tid: duplicate relation failed"
+              else
+                echo "::warning::$tid: duplicate_of $dup not in context; skipping relation"
+              fi
+            fi
+
+            # 3) comment
+            gql 'mutation($i:String!,$b:String!){commentCreate(input:{issueId:$i,body:$b}){success}}' \
+              "$(jq -n --arg i "$uuid" --arg b "$body" '{i:$i,b:$b}')" >/dev/null \
+              || echo "::warning::$tid: comment failed"
+
+            # 4) priority LAST — flips the ticket out of the untriaged sentinel
+            gql 'mutation($id:String!,$p:Int!){issueUpdate(id:$id,input:{priority:$p}){success}}' \
+              "$(jq -n --arg id "$uuid" --argjson p "$pnum" '{id:$id,p:$p}')" >/dev/null \
+              || { echo "::error::$tid: priority update failed"; failed=$((failed+1)); continue; }
+
+            echo "  $tid -> $cat / $pri / $tstate${dup:+ (dup of $dup)}"
+            applied=$((applied+1))
+          done
+          echo "::notice::Triage applied=$applied failed=$failed"
+          [[ "$failed" -eq 0 ]] || exit 1
