@@ -55,6 +55,10 @@ on:
 
 permissions:
   contents: read
+  id-token: write # claude-code-action@v1 fetches a GitHub OIDC token (WIF);
+  # absent this the Triage step dies with "Could not fetch an OIDC token".
+  # NOTE: the CALLER workflow must also grant id-token: write — a reusable
+  # workflow cannot obtain a scope the caller didn't grant.
 
 concurrency:
   group: triage-testflight-${{ inputs.app_name }}
@@ -266,16 +270,14 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: ${{ steps.render.outputs.prompt }}
-          # The action installs Linear MCP via its standard mcp_config plumbing.
-          # If your fork of the action exposes a different MCP setup, swap here.
-          mcp_config: |
-            {
-              "mcpServers": {
-                "linear": {
-                  "command": "npx",
-                  "args": ["-y", "linear-mcp-server"],
-                  "env": { "LINEAR_API_KEY": "${{ secrets.LINEAR_API_TOKEN }}" }
-                }
-              }
-            }
+          track_progress: false # headless prompt run — no PR/issue progress UI
+          # claude-code-action@v1 dropped the `mcp_config` input; MCP servers
+          # are registered through `claude_args` via `--mcp-config`. Use INLINE
+          # JSON — a file path is silently dropped (anthropics/claude-code-action#1004).
+          # `--allowedTools` is required for the Linear MCP tools to be callable
+          # in a non-interactive (prompt-driven) run.
+          claude_args: >-
+            --mcp-config '{"mcpServers":{"linear":{"command":"npx","args":["-y","linear-mcp-server"],"env":{"LINEAR_API_KEY":"${{ secrets.LINEAR_API_TOKEN }}"}}}}'
+            --allowedTools "mcp__linear__*"
