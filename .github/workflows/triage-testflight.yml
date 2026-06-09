@@ -113,11 +113,16 @@ jobs:
           echo "Resolved app_id=$APP_ID window=${WINDOW_HOURS}h since=$(date -u -d "@$since_epoch" -Iseconds) dry_run=${DRY_RUN}"
 
           attachments_for_url() {
-            curl -fsS -X POST https://api.linear.app/graphql \
+            # No URL to dedupe against → treat as "not yet linked".
+            [[ -n "$1" && "$1" != "null" ]] || { echo 0; return 0; }
+            # Drop -f so an HTTP/GraphQL error body is still parsed (not fatal);
+            # null-guard the path so a missing/errored payload yields 0, not a
+            # jq "Cannot iterate over null" crash under `set -e`.
+            curl -sS -X POST https://api.linear.app/graphql \
               -H "Authorization: $LINEAR_API_KEY" \
               -H "Content-Type: application/json" \
               -d "$(jq -n --arg u "$1" '{query:"query($u:String!){attachmentsForURL(url:$u,first:1){nodes{id}}}",variables:{u:$u}}')" \
-              | jq -r '.data.attachmentsForURL.nodes | length'
+              | jq -r '(.data.attachmentsForURL.nodes // []) | length' 2>/dev/null || echo 0
           }
 
           created=0; skipped=0; failed=0
@@ -143,6 +148,12 @@ jobs:
               id=$(jq -r '.id' <<<"$item")
               url=$(jq -r '.url' <<<"$item")
 
+              # TEMP diagnostic (dry-run only, keys/types only — no PII): learn
+              # the real asc feedback payload shape so we extract content correctly.
+              if [[ "$DRY_RUN" == "true" ]]; then
+                echo "    [diag] $id itemKeys=$(jq -cr 'keys' <<<"$item") urlType=$(jq -r '.url|type' <<<"$item") attrsType=$(jq -r '.attrs|type' <<<"$item") attrsKeys=$(jq -cr 'if (.attrs|type)=="object" then (.attrs|keys) else .attrs end' <<<"$item")"
+              fi
+
               if [[ "$(attachments_for_url "$url")" != "0" ]]; then
                 echo "    $id: already linked, skip"
                 skipped=$((skipped + 1))
@@ -154,7 +165,7 @@ jobs:
               title="[TestFlight ${kind}] ${first:-${kind} feedback} (${id: -12})"
 
               meta=$(jq -r '
-                .attrs | to_entries
+                (.attrs // {}) | to_entries
                 | map(select(.key | test("^(createdDate|email|deviceModel|osVersion|connectionType|batteryPercentage|architecture|appUptimeInMilliseconds|diskBytesAvailable|diskBytesTotal)$")))
                 | map("- **\(.key):** \(.value)") | join("\n")
               ' <<<"$item")
