@@ -55,10 +55,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write # claude-code-action@v1 fetches a GitHub OIDC token (WIF);
-  # absent this the Triage step dies with "Could not fetch an OIDC token".
-  # NOTE: the CALLER workflow must also grant id-token: write — a reusable
-  # workflow cannot obtain a scope the caller didn't grant.
 
 concurrency:
   group: triage-testflight-${{ inputs.app_name }}
